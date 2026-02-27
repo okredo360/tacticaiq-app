@@ -1115,14 +1115,72 @@ function setAPIStatus(connected, msg) {
 async function fetchLiveMatches() {
   if (!API_BASE) { setAPIStatus(false, 'No API URL set'); return; }
   try {
-    const res = await fetchWithTimeout(`${API_BASE}/live`, 5000);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    renderMatchCards(data, true);
-    setAPIStatus(true);
+    // First try live matches
+    const liveRes = await fetchWithTimeout(`${API_BASE}/live`, 5000);
+    if (!liveRes.ok) throw new Error(`HTTP ${liveRes.status}`);
+    const liveData = await liveRes.json();
+
+    if (liveData && liveData.length > 0) {
+      // Live games happening now
+      renderMatchCards(liveData, 'live');
+      setAPIStatus(true);
+    } else {
+      // No live games — fetch today + yesterday fixtures
+      await fetchRecentFixtures();
+    }
   } catch (err) {
     setAPIStatus(false, `Unreachable: ${err.message}`);
-    renderMatchCards(MATCHES, false);
+    renderMatchCards([], 'offline');
+  }
+}
+
+async function fetchRecentFixtures() {
+  try {
+    // Get today and yesterday for popular leagues
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const fmt = d => d.toISOString().split('T')[0];
+
+    // Fetch today first, fallback to yesterday
+    const leagues = [39, 140, 135, 78, 2]; // PL, LaLiga, SerieA, Bundesliga, UCL
+    let fixtures = [];
+
+    for (const league of leagues) {
+      try {
+        const res = await fetchWithTimeout(`${API_BASE}/fixtures?date=${fmt(today)}&league=${league}&season=2024`, 5000);
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.length) fixtures = fixtures.concat(data);
+        }
+      } catch(e) { /* skip */ }
+      if (fixtures.length >= 6) break;
+    }
+
+    // Try yesterday if nothing today
+    if (!fixtures.length) {
+      for (const league of leagues) {
+        try {
+          const res = await fetchWithTimeout(`${API_BASE}/fixtures?date=${fmt(yesterday)}&league=${league}&season=2024`, 5000);
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.length) fixtures = fixtures.concat(data);
+          }
+        } catch(e) { /* skip */ }
+        if (fixtures.length >= 6) break;
+      }
+    }
+
+    if (fixtures.length > 0) {
+      renderMatchCards(fixtures, 'recent');
+      setAPIStatus(true, `${fixtures.length} fixtures loaded`);
+    } else {
+      renderMatchCards([], 'nomatches');
+      setAPIStatus(true, 'No fixtures today — check back on match day');
+    }
+  } catch(err) {
+    renderMatchCards([], 'offline');
+    setAPIStatus(false, err.message);
   }
 }
 
@@ -1350,7 +1408,7 @@ function navigate(page, id=null) {
   if(page==='reports') renderReports();
   if(page==='players') renderPlayersList();
   if(page==='home') renderHome();
-  if(page==='matches') renderMatches();
+  if(page==='matches') renderMatches(); // async — fetches real fixtures
   if(page==='settings') setTimeout(renderSettingsAPIPanel,50);
   document.getElementById('main').scrollTop=0;
 }
@@ -1417,41 +1475,183 @@ function matchCardHTML(m) {
 }
 
 // Used by live engine to render API cards or fall back to static
-function renderMatchCards(data, isLive) {
+function renderMatchCards(data, mode) {
   const container = document.getElementById('homeMatchList');
   if (!container) return;
-  if (!isLive || !data?.length) {
-    container.innerHTML = MATCHES.slice(0,3).map(m=>matchCardHTML(m)).join('');
+
+  // No API or offline — show demo data
+  if (mode === 'offline' || !data || !data.length) {
+    if (mode === 'nomatches') {
+      container.innerHTML = `<div style="text-align:center;padding:30px 20px;color:var(--text3);font-size:.8rem;">
+        <div style="font-size:2rem;margin-bottom:8px;">⚽</div>
+        <div style="color:var(--text2);margin-bottom:4px;">No fixtures scheduled today</div>
+        <div>Check back on match day — weekends & Tuesday/Wednesday evenings</div>
+      </div>`;
+    } else {
+      container.innerHTML = MATCHES.slice(0,3).map(m=>matchCardHTML(m)).join('');
+    }
     return;
   }
-  container.innerHTML = data.map(match=>`
-    <div class="match-card" onclick="loadMatchAnalytics(${match.fixture.id})">
+
+  // Live matches
+  if (mode === 'live') {
+    container.innerHTML = data.map(match=>`
+      <div class="match-card" onclick="loadMatchAnalytics(${match.fixture.id})">
+        <div class="mc-comp">
+          <span>${match.league?.name||'Live Match'}</span>
+          <span class="tag tag-red"><span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--red);margin-right:3px;animation:pulse 1.2s infinite;vertical-align:middle;"></span>LIVE ${match.fixture?.status?.elapsed||0}'</span>
+        </div>
+        <div class="mc-teams">
+          <div class="mc-team-name home">${match.teams?.home?.name||'Home'}</div>
+          <div class="mc-score">${match.goals?.home??0} — ${match.goals?.away??0}</div>
+          <div class="mc-team-name away">${match.teams?.away?.name||'Away'}</div>
+        </div>
+        <div class="mc-footer">
+          <div class="mc-stats"><div class="mc-stat">Min <span>${match.fixture?.status?.elapsed||0}'</span></div></div>
+          <div class="mc-action">Analyse →</div>
+        </div>
+      </div>`).join('');
+    return;
+  }
+
+  // Recent/today fixtures from API
+  container.innerHTML = data.slice(0, 6).map(match => {
+    const status = match.fixture?.status?.short || 'NS';
+    const elapsed = match.fixture?.status?.elapsed;
+    const isFinished = status === 'FT' || status === 'AET' || status === 'PEN';
+    const isLive = status === '1H' || status === '2H' || status === 'HT' || status === 'ET';
+    const isUpcoming = status === 'NS' || status === 'TBD';
+    const kickoff = match.fixture?.date ? new Date(match.fixture.date).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
+    const homeGoals = match.goals?.home ?? (isUpcoming ? '' : 0);
+    const awayGoals = match.goals?.away ?? (isUpcoming ? '' : 0);
+    const scoreDisplay = isUpcoming ? kickoff : `${homeGoals} — ${awayGoals}`;
+    const statusTag = isLive
+      ? `<span class="tag tag-red"><span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--red);margin-right:3px;animation:pulse 1.2s infinite;vertical-align:middle;"></span>LIVE ${elapsed||0}'</span>`
+      : isFinished
+      ? `<span class="tag tag-blue">FT</span>`
+      : `<span class="tag tag-green" style="background:rgba(0,255,135,.1);border:1px solid rgba(0,255,135,.3);color:var(--accent)">KO ${kickoff}</span>`;
+
+    return `<div class="match-card" onclick="loadMatchAnalytics(${match.fixture?.id})">
       <div class="mc-comp">
-        <span>${match.league?.name||'Live Match'}</span>
-        <span class="tag tag-red"><span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--red);margin-right:3px;animation:pulse 1.2s infinite;vertical-align:middle;"></span>LIVE ${match.fixture?.status?.elapsed||0}'</span>
+        <span>${match.league?.name||'Football'} · ${match.league?.country||''}</span>
+        ${statusTag}
       </div>
       <div class="mc-teams">
         <div class="mc-team-name home">${match.teams?.home?.name||'Home'}</div>
-        <div class="mc-score">${match.goals?.home??0} — ${match.goals?.away??0}</div>
+        <div class="mc-score">${scoreDisplay}</div>
         <div class="mc-team-name away">${match.teams?.away?.name||'Away'}</div>
       </div>
       <div class="mc-footer">
-        <div class="mc-stats"><div class="mc-stat">Min <span>${match.fixture?.status?.elapsed||0}'</span></div></div>
+        <div class="mc-stats">
+          <div class="mc-stat">Round <span>${match.league?.round||'-'}</span></div>
+          <div class="mc-stat">Venue <span>${match.fixture?.venue?.name?.split(' ')[0]||'-'}</span></div>
+        </div>
         <div class="mc-action">Analyse →</div>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
-function renderMatches() {
-  const el=document.getElementById('matchesList');
-  if(el) el.innerHTML=MATCHES.map(m=>matchCardHTML(m)).join('');
+let REAL_FIXTURES = []; // cache of fetched fixtures
+
+async function renderMatches() {
+  const el = document.getElementById('matchesList');
+  if (!el) return;
+  el.innerHTML = '<div style="text-align:center;padding:30px;color:var(--text3);">Loading fixtures…</div>';
+
+  if (!API_BASE) {
+    el.innerHTML = MATCHES.map(m=>matchCardHTML(m)).join('');
+    return;
+  }
+
+  try {
+    const today = new Date();
+    const dates = [-1, 0, 1, 2, 3].map(d => {
+      const date = new Date(today);
+      date.setDate(date.getDate() + d);
+      return date.toISOString().split('T')[0];
+    });
+
+    const leagues = [39, 140, 135, 78, 61, 2, 3];
+    let allFixtures = [];
+
+    for (const date of dates) {
+      for (const league of leagues) {
+        try {
+          const res = await fetchWithTimeout(`${API_BASE}/fixtures?date=${date}&league=${league}&season=2024`, 5000);
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.length) allFixtures = allFixtures.concat(data);
+          }
+        } catch(e) {}
+        if (allFixtures.length >= 30) break;
+      }
+      if (allFixtures.length >= 30) break;
+    }
+
+    REAL_FIXTURES = allFixtures;
+
+    if (allFixtures.length > 0) {
+      el.innerHTML = allFixtures.map(match => realFixtureCardHTML(match)).join('');
+    } else {
+      el.innerHTML = MATCHES.map(m=>matchCardHTML(m)).join('');
+    }
+  } catch(err) {
+    el.innerHTML = MATCHES.map(m=>matchCardHTML(m)).join('');
+  }
 }
+
+function realFixtureCardHTML(match) {
+  const status = match.fixture?.status?.short || 'NS';
+  const elapsed = match.fixture?.status?.elapsed;
+  const isFinished = ['FT','AET','PEN'].includes(status);
+  const isLive = ['1H','2H','HT','ET'].includes(status);
+  const isUpcoming = ['NS','TBD'].includes(status);
+  const kickoff = match.fixture?.date ? new Date(match.fixture.date).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
+  const homeGoals = match.goals?.home ?? 0;
+  const awayGoals = match.goals?.away ?? 0;
+  const scoreDisplay = isUpcoming ? kickoff : `${homeGoals} — ${awayGoals}`;
+  const statusTag = isLive
+    ? `<span class="tag tag-red"><span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--red);margin-right:3px;animation:pulse 1.2s infinite;vertical-align:middle;"></span>LIVE ${elapsed||0}'</span>`
+    : isFinished ? `<span class="tag tag-blue">FT</span>`
+    : `<span class="tag tag-green" style="background:rgba(0,255,135,.1);border:1px solid rgba(0,255,135,.3);color:var(--accent)">KO ${kickoff}</span>`;
+
+  return `<div class="match-card" onclick="loadMatchAnalytics(${match.fixture?.id})">
+    <div class="mc-comp">
+      <span>${match.league?.name||'Football'} · ${match.league?.country||''}</span>
+      ${statusTag}
+    </div>
+    <div class="mc-teams">
+      <div class="mc-team-name home">${match.teams?.home?.name||'Home'}</div>
+      <div class="mc-score">${scoreDisplay}</div>
+      <div class="mc-team-name away">${match.teams?.away?.name||'Away'}</div>
+    </div>
+    <div class="mc-footer">
+      <div class="mc-stats">
+        <div class="mc-stat">Round <span>${match.league?.round||'-'}</span></div>
+        <div class="mc-stat">${match.fixture?.venue?.city||''}</div>
+      </div>
+      <div class="mc-action">Analyse →</div>
+    </div>
+  </div>`;
+}
+
 function filterMatches(el, key) {
   document.querySelectorAll('#page-matches .tab-btn').forEach(b=>b.classList.remove('active'));
   el.classList.add('active');
-  const filtered=key==='all'?MATCHES:MATCHES.filter(m=>m.compKey===key);
-  const cont=document.getElementById('matchesList');
-  if(cont) cont.innerHTML=filtered.map(m=>matchCardHTML(m)).join('');
+  const cont = document.getElementById('matchesList');
+  if (!cont) return;
+
+  if (REAL_FIXTURES.length > 0) {
+    const leagueMap = {'PL':39,'CL':2,'LL':140,'BL':78,'SA':135,'L1':61};
+    const filtered = key === 'all' ? REAL_FIXTURES : REAL_FIXTURES.filter(m => m.league?.id === leagueMap[key]);
+    cont.innerHTML = filtered.length
+      ? filtered.map(m => realFixtureCardHTML(m)).join('')
+      : '<div style="text-align:center;padding:20px;color:var(--text3);">No fixtures for this competition</div>';
+  } else {
+    const filtered = key === 'all' ? MATCHES : MATCHES.filter(m => m.compKey === key);
+    cont.innerHTML = filtered.map(m => matchCardHTML(m)).join('');
+  }
 }
 
 // ═══════════════════════════════════════════════════
